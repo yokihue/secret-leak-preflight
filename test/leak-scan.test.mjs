@@ -62,7 +62,8 @@ test('干净目录 → exit 0', () => {
 test('--json 输出结构：blocked/findings/tools/skipped/scanErrors', () => {
   const dir = makeTempDir();
   try {
-    writeFileSync(join(dir, '.env'), 'TEST_OPENAI_API_KEY=sk-test-abcdefghijklmnopqrstuvwxyz\n');
+    const secret = 'sk-test-abcdefghijklmnopqrstuvwxyz';
+    writeFileSync(join(dir, '.env'), `TEST_OPENAI_API_KEY=${secret}\n`);
     const res = runScan([dir, '--json', '--no-external'], process.cwd());
     assert.equal(res.status, 2);
     const parsed = JSON.parse(res.stdout);
@@ -73,6 +74,8 @@ test('--json 输出结构：blocked/findings/tools/skipped/scanErrors', () => {
     assert.ok(parsed.target);
     assert.ok(parsed.skipped && typeof parsed.skipped.files === 'number');
     assert.ok(Array.isArray(parsed.scanErrors));
+    // redact 硬不变量：JSON 序列化结果不得含密钥值（agent 消费主通道）
+    assert.ok(!res.stdout.includes(secret), 'JSON output leaked secret value');
   } finally {
     cleanup(dir);
   }
@@ -103,6 +106,7 @@ test('staged 场景：--staged 通道产出带 staged 标识的真实文件名',
     const add = spawnSync('git', ['add', 'config.json'], { cwd: dir, encoding: 'utf8' });
     assert.equal(add.status, 0, `git add failed: ${add.stderr}`);
     // --staged --json：staged 通道产出的 finding 应带 staged 标识与真实文件名
+    const secret = 'sk-test-abcdefghijklmnopqrstuvwxyz';
     const staged = runScan([dir, '--staged', '--json', '--no-external'], process.cwd());
     assert.equal(staged.status, 2, `staged scan expected exit 2, got ${staged.status}`);
     const parsed = JSON.parse(staged.stdout);
@@ -112,6 +116,8 @@ test('staged 场景：--staged 通道产出带 staged 标识的真实文件名',
     assert.ok(stagedFindings.every((f) => f.file === 'config.json'), `staged finding file wrong: ${stagedFindings.map((f) => f.file).join(',')}`);
     // line 应 > 0（hunk 行号已解析）
     assert.ok(stagedFindings.every((f) => f.line > 0), 'staged finding line must be > 0');
+    // redact 硬不变量：staged 通道的 JSON 输出也不得含密钥值
+    assert.ok(!staged.stdout.includes(secret), 'staged JSON output leaked secret value');
   } finally {
     cleanup(dir);
   }
@@ -154,20 +160,41 @@ test('目标为单文件 → exit 1（必须目录）', () => {
   }
 });
 
-test('--history 在非 git 目录被跳过但 exit 不误报', () => {
+test('--history 在非 git 目录 → scanErrors 告警且 exit 1（不静默假通过）', () => {
   const dir = makeTempDir();
   try {
     writeFileSync(join(dir, 'README.md'), '# hello\n');
-    // 非 git 仓库：history 扫描静默跳过（gitRepo=false），exit 0 且 scanErrors 为空
+    // 非 git 仓库：请求 --history 但 gitRepo=false → 必须告警（scanErrors 非空）并 exit 1，
+    // 不允许静默跳过假装"扫过且干净"
     const res = runScan([dir, '--history', '--json', '--no-external'], process.cwd());
-    assert.equal(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}`);
+    assert.equal(res.status, 1, `expected exit 1, got ${res.status}\n${res.stdout}`);
     const parsed = JSON.parse(res.stdout);
-    assert.equal(parsed.scanErrors.length, 0, 'non-git history skip must not be an error');
+    assert.ok(parsed.scanErrors.length > 0, 'non-git history skip must produce a scanError');
+    assert.ok(parsed.scanErrors.some((e) => e.includes('not a git repository')), 'scanErrors must explain the skip');
   } finally {
     cleanup(dir);
   }
 });
-// 注：--history/--staged 在 gitRepo=true 时失败（超时/工具错误）→ scanErrors 非空 → exit 1
-// 的路径依赖外部工具行为（git 2.55 对空仓库 --all 返回 exit 0，gitleaks 参数固定、
-// trufflehog 未安装），单测无法稳定构造真实失败场景，未覆盖——机制本身
-// （scanErrors 非空 → exit 1）由上方"未知 CLI 参数"测试间接验证，标记为已知测试缺口。
+
+test('gitleaks 外部工具：安装且检出时产生 finding（不静默）', () => {
+  const dir = makeTempDir();
+  try {
+    // 初始化 git repo 并提交一个 gitleaks 能识别的 AWS key（AKIA 格式）
+    const init = spawnSync('git', ['init', '-q'], { cwd: dir, encoding: 'utf8' });
+    assert.equal(init.status, 0, `git init failed: ${init.stderr}`);
+    writeFileSync(join(dir, 'creds.txt'), 'aws_access_key_id=AKIATESTFODNN7EXAMPL\n');
+    spawnSync('git', ['add', 'creds.txt'], { cwd: dir });
+    const commit = spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: dir });
+    assert.equal(commit.status, 0, `git commit failed: ${commit.stderr}`);
+    // 不带 --no-external：gitleaks 已装时真实调用。若未装则降级跳过（测试不失败）
+    const res = runScan([dir, '--json'], process.cwd());
+    const parsed = JSON.parse(res.stdout);
+    if (parsed.tools.gitleaks) {
+      // gitleaks 可用：应产生 gitleaks finding 或 scanErrors（工具报错），而非静默
+      const hasGitleaksSignal = parsed.findings.some((f) => f.rule === 'gitleaks') || parsed.scanErrors.some((e) => e.includes('gitleaks'));
+      assert.ok(hasGitleaksSignal, 'gitleaks available but produced no signal (silent)');
+    }
+  } finally {
+    cleanup(dir);
+  }
+});

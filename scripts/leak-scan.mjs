@@ -34,14 +34,22 @@ const SKIP_DIRS = new Set(['.git', 'node_modules', '.venv', 'venv', 'dist', 'bui
 const MAX_FILE_BYTES = 1024 * 1024; // >1MB 跳过
 const SEVERITIES = ['Critical', 'High', 'Medium', 'Low'];
 
-// 伪阳性判定（值级）：仅当"匹配值本身"含示例/占位特征时跳过。
-// 不做整行丢弃——同一行其他规则或同一规则的其他匹配不受影响。
+// 伪阳性判定（值级）：仅当"匹配值本身"是明显的占位/示例模式时跳过。
+// 注意：不能做无词边界的子串匹配——真实密钥值可能恰含 example/fake/dummy
+// 子串（如 AWS 官方示例密钥 wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY）。
+// 策略：值整体匹配占位形态（your-xxx-here / 全小写示例 / xxxx 串）才跳过。
 function isPlaceholder(matchText) {
   // 赋值形态（api_key = "xxx" / token: 'xxx'）取等号/冒号后的值段判定；
   // 非赋值形态（裸 sk-... 等）对整个匹配串判定。
   const eq = /[:=]\s*['"]?([^'"\s]+)/i.exec(matchText);
   const value = eq ? eq[1] : matchText;
-  return /(example|placeholder|dummy|fake|xxxx+|your[-_ ]?api[-_ ]?key)/i.test(value);
+  // 占位形态：your-xxx-here / your-api-key / 全 x / 常见假值前缀（example/sample/dummy/fake）
+  // 注意：不含 test 前缀——sk-test-/sk_test_ 是 Stripe 测试 key 真实格式，必须检出
+  if (/^x{4,}$/i.test(value)) return true;
+  if (/^your[-_ ]?(api[-_ ]?key|key|secret|token|password)([-_ ]?(here|goes|example))?$/i.test(value)) return true;
+  if (/^(example|sample|dummy|fake)[-_ ]?(key|secret|token|password|api[-_ ]?key)?$/i.test(value)) return true;
+  if (/^(sk|ghp|gho|ghu|ghs|ghr|github_pat|AKIA|AIza)-?(example|sample|dummy|fake|your)/i.test(value)) return true;
+  return false;
 }
 
 // 文件名规则：匹配返回 { severity, rule, message }
@@ -165,8 +173,9 @@ function scanText(text, label, findings) {
       addLine = parseInt(hunkHdr[1], 10);
       continue;
     }
-    if (!line.startsWith('+')) continue; // 只看新增行（含 hunk 上下文之外的 + 行）
-    const content = line.slice(1);
+    // 新侧行号：+ 新增行与空格上下文行都占位；- 删除行不占位
+    if (line.startsWith('-') || line.startsWith('\\')) continue;
+    const content = line.startsWith('+') ? line.slice(1) : line.slice(1);
     for (const rule of rules) {
       const m = rule.regex.exec(content);
       if (m && !isPlaceholder(m[0])) {
@@ -186,14 +195,18 @@ function scanText(text, label, findings) {
 // ---------- 外部工具 ----------
 
 function runExternalTools(target, gitRepo, findings, tools, scanErrors) {
-  // gitleaks：exit 1 = 发现泄漏（阻断）；其他非零 = 工具错误（告警不阻断）
+  // 外部工具失败分类：泄漏（阻断）/ 工具错误（告警不阻断）/ 崩溃或超时（告警，不静默）
+  // gitleaks：exit 1 = 发现泄漏（阻断）；其他非零 = 工具错误；code:null = 超时/崩溃
   tools.gitleaks = commandExists('gitleaks');
   if (tools.gitleaks && gitRepo) {
     const res = runCmd('gitleaks', ['detect', '--source', target, '--redact', '--no-banner'], { cwd: target });
     if (res.code === 1) {
       findings.push({ severity: 'High', rule: 'gitleaks', file: '.', line: 0, message: 'Gitleaks reported possible secrets. Re-run gitleaks locally for redacted detail.' });
     } else if (res.code !== 0 && res.code !== null) {
-      scanErrors.push(`gitleaks detect failed (exit ${res.code}): ${res.stderr.trim().slice(0, 200) || 'see gitleaks output'}`);
+      // stderr 不原文透传（可能含密钥值），只报退出码与错误类别
+      scanErrors.push(`gitleaks detect failed (exit ${res.code}) — tool error; re-run gitleaks manually for details`);
+    } else if (res.code === null) {
+      scanErrors.push('gitleaks detect crashed or timed out — tool error; re-run gitleaks manually for details');
     }
   }
   // trufflehog：用相对路径 file://.（对齐 tooling.md 已文档化的可用形式；
@@ -204,7 +217,9 @@ function runExternalTools(target, gitRepo, findings, tools, scanErrors) {
     if (res.ok && res.stdout.trim().length > 0) {
       findings.push({ severity: 'Critical', rule: 'trufflehog-verified', file: '.', line: 0, message: 'TruffleHog reported verified secrets. Rotate affected credentials immediately.' });
     } else if (!res.ok && res.code !== null) {
-      scanErrors.push(`trufflehog git failed (exit ${res.code}): ${res.stderr.trim().slice(0, 200) || 'see trufflehog output'}`);
+      scanErrors.push(`trufflehog git failed (exit ${res.code}) — tool error; re-run trufflehog manually for details`);
+    } else if (!res.ok && res.code === null) {
+      scanErrors.push('trufflehog git crashed or timed out — tool error; re-run trufflehog manually for details');
     }
   }
 }
@@ -296,22 +311,30 @@ function main() {
   for (const f of files) scanFile(f, findings, skipped);
 
   // staged 深度检测：失败/超时 → 记入 scanErrors（不静默假通过）
-  if (opts.staged && gitRepo) {
-    const res = runCmd('git', ['-C', target, 'diff', '--cached']);
-    if (res.ok) {
-      scanText(res.stdout, 'staged', findings);
+  if (opts.staged) {
+    if (!gitRepo) {
+      scanErrors.push('--staged requested but target is not a git repository; staged scan skipped');
     } else {
-      scanErrors.push(`git diff --cached failed${res.code !== null ? ` (exit ${res.code})` : ` (${res.error.message})`}`);
+      const res = runCmd('git', ['-C', target, 'diff', '--cached']);
+      if (res.ok) {
+        scanText(res.stdout, 'staged', findings);
+      } else {
+        scanErrors.push(`git diff --cached failed${res.code !== null ? ` (exit ${res.code})` : ` (${res.error.message})`}`);
+      }
     }
   }
 
   // history 深度检测：同上
-  if (opts.history && gitRepo) {
-    const res = runCmd('git', ['-C', target, 'log', '-p', '--all'], { timeout: 120000 });
-    if (res.ok) {
-      scanText(res.stdout, 'history', findings);
+  if (opts.history) {
+    if (!gitRepo) {
+      scanErrors.push('--history requested but target is not a git repository; history scan skipped');
     } else {
-      scanErrors.push(`git log -p --all ${res.code !== null ? `(exit ${res.code})` : `(${res.error.message})`} — history scan incomplete`);
+      const res = runCmd('git', ['-C', target, 'log', '-p', '--all'], { timeout: 120000 });
+      if (res.ok) {
+        scanText(res.stdout, 'history', findings);
+      } else {
+        scanErrors.push(`git log -p --all ${res.code !== null ? `(exit ${res.code})` : `(${res.error.message})`} — history scan incomplete`);
+      }
     }
   }
 

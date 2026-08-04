@@ -41,6 +41,10 @@ const CASES = {
     positive: 'AKIATESTFODNN7EXAMPL', // AKIA + 16 位大写字母（TEST 标记），仍命中正则
     negative: 'AKIAIOSFODNN7EXAMP', // 15 位
   },
+  'aws-secret-key': {
+    positive: 'AWS_SECRET_ACCESS_KEY=' + 'wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY',
+    negative: 'AWS_SECRET_ACCESS_KEY=short', // 值 <16
+  },
   'google-api-key': {
     positive: 'AIzaTESTABCDEFGHIJKLMNOPQRSTUVWXYZ',
     negative: 'AIzaShort',

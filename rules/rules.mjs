@@ -66,6 +66,14 @@ export const rules = [
     remediation: 'Deactivate in AWS IAM, review usage, rotate the pair.',
   },
   {
+    id: 'aws-secret-key',
+    name: 'AWS Secret Access Key',
+    severity: 'Critical',
+    regex: /(AWS[_-]?SECRET[_-]?ACCESS[_-]?KEY|SecretAccessKey|aws[_-]?secret[_-]?access[_-]?key)\s*[:=]\s*['"]?[A-Za-z0-9/+=]{16,}/i,
+    description: 'AWS secret access key assignment (AWS_SECRET_ACCESS_KEY=...) found.',
+    remediation: 'Deactivate in AWS IAM, review usage, rotate the pair.',
+  },
+  {
     id: 'google-api-key',
     name: 'Google API Key',
     severity: 'High',
