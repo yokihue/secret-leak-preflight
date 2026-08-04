@@ -1,5 +1,7 @@
 # Secret Leak Preflight
 
+[![skills.sh](https://skills.sh/b/yokihue/secret-leak-preflight)](https://skills.sh/yokihue/secret-leak-preflight)
+
 发布前秘密泄漏预检。在任何项目开源、推 GitHub、发压缩包或交给别人之前，先挡一遍常见的 API Key / Token / `.env` / 私钥 / 配置文件泄漏风险。
 
 兼容 Claude Code、Codex、Cursor、Gemini CLI、天枢等主流 AI Agent，也支持命令行直接使用。
